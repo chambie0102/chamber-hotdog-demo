@@ -1,0 +1,77 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: PLACEHOLDER_NAME
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      tolerations:
+      - key: "nvidia.com/gpu"
+        operator: "Equal"
+        value: "true"
+        effect: "NoSchedule"
+      nodeSelector:
+        nvidia.com/gpu.product: Tesla-T4
+      volumes:
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 2Gi
+      containers:
+      - name: train
+        image: chambie0102/chamber-hotdog-demo:v1
+        command:
+        - sh
+        - -c
+        - |
+          python -c "
+          import os, torch, torch.nn as nn
+          from torchvision import models
+          model_name = os.environ['MODEL_NAME']
+          batch_size = int(os.environ['BATCH_SIZE'])
+          num_steps = int(os.environ['NUM_STEPS'])
+          lr = float(os.environ['LEARNING_RATE'])
+          print('GPU:', torch.cuda.get_device_name(0))
+          print('VRAM: {:.1f}GB'.format(torch.cuda.get_device_properties(0).total_memory/1e9))
+          print('Config: model={} batch_size={} steps={} lr={}'.format(model_name, batch_size, num_steps, lr))
+          print('Loading model...')
+          model = getattr(models, model_name)(weights=None, num_classes=2).cuda()
+          param_count = sum(p.numel() for p in model.parameters())
+          print('Model loaded: {:.1f}M params, mem={:.2f}GB'.format(param_count/1e6, torch.cuda.memory_allocated()/1e9))
+          optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+          criterion = nn.CrossEntropyLoss()
+          print('Starting training...')
+          for step in range(num_steps):
+              x = torch.randn(batch_size, 3, 224, 224).cuda()
+              y = torch.randint(0, 2, (batch_size,)).cuda()
+              out = model(x)
+              loss = criterion(out, y)
+              loss.backward()
+              optimizer.step()
+              optimizer.zero_grad()
+              if step % 50 == 0:
+                  print('Step {}/{} loss={:.4f} mem={:.1f}GB'.format(step, num_steps, loss.item(), torch.cuda.memory_allocated()/1e9))
+          print('Training complete!')
+          "
+        env:
+        - name: MODEL_NAME
+          value: "vit_l_16"
+        - name: BATCH_SIZE
+          value: "128"
+        - name: NUM_STEPS
+          value: "300"
+        - name: LEARNING_RATE
+          value: "1e-4"
+        - name: WANDB_MODE
+          value: "disabled"
+        volumeMounts:
+        - name: dshm
+          mountPath: /dev/shm
+        resources:
+          requests:
+            memory: 4Gi
+          limits:
+            memory: 8Gi
+            nvidia.com/gpu: 1
