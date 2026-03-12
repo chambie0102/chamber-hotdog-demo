@@ -1,0 +1,62 @@
+# v3: More epochs, lower LR, dropout — fix hotdog class underperformance
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: hotdog-v3-1773291794
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      tolerations:
+      - key: "nvidia.com/gpu"
+        operator: "Equal"
+        value: "true"
+        effect: "NoSchedule"
+      nodeSelector:
+        nvidia.com/gpu.product: Tesla-T4
+      volumes:
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 2Gi
+      containers:
+      - name: train
+        image: chambie0102/chamber-hotdog-demo:v2
+        command: ["python", "train.py"]
+        env:
+        - name: BATCH_SIZE
+          value: "64"
+        - name: LEARNING_RATE
+          value: "5e-4"
+        - name: EPOCHS
+          value: "8"
+        - name: AUGMENTATION
+          value: "basic"
+        - name: OPTIMIZER
+          value: "adamw"
+        - name: USE_CLASS_WEIGHTS
+          value: "true"
+        - name: WARMUP_EPOCHS
+          value: "1"
+        - name: DROPOUT
+          value: "0.3"
+        - name: NUM_WORKERS
+          value: "4"
+        - name: WANDB_PROJECT
+          value: "chamber-hotdog"
+        - name: WANDB_ENTITY
+          value: "jasonong-chamberai"
+        - name: WANDB_API_KEY
+          value: "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"
+        volumeMounts:
+        - name: dshm
+          mountPath: /dev/shm
+        resources:
+          requests:
+            memory: "4Gi"
+            cpu: "2"
+          limits:
+            memory: "8Gi"
+            cpu: "4"
+            nvidia.com/gpu: 1
