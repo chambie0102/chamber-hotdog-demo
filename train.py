@@ -1,0 +1,290 @@
+"""Hot Dog / Not Hot Dog Classifier — Chamber GPU Training Job.
+
+ResNet-18 fine-tuned on Food-101 (hotdog class vs balanced sample of others).
+All hyperparams via environment variables for iteration without rebuild.
+Memory-efficient: stores indices only, loads images lazily.
+"""
+import os
+import random
+import torch
+import torch.nn as nn
+import torchvision
+import torchvision.transforms as T
+from torch.utils.data import DataLoader, Dataset
+from collections import defaultdict
+
+# ── Env Vars ──────────────────────────────────────────────
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "64"))
+LEARNING_RATE = float(os.environ.get("LEARNING_RATE", "1e-3"))
+EPOCHS = int(os.environ.get("EPOCHS", "5"))
+DROPOUT = float(os.environ.get("DROPOUT", "0.0"))
+USE_CLASS_WEIGHTS = os.environ.get("USE_CLASS_WEIGHTS", "false").lower() == "true"
+AUGMENTATION = os.environ.get("AUGMENTATION", "none")
+WARMUP_EPOCHS = int(os.environ.get("WARMUP_EPOCHS", "0"))
+NUM_WORKERS = int(os.environ.get("NUM_WORKERS", "2"))
+OPTIMIZER = os.environ.get("OPTIMIZER", "adam")
+WANDB_PROJECT = os.environ.get("WANDB_PROJECT", "chamber-hotdog")
+WANDB_ENTITY = os.environ.get("WANDB_ENTITY", "")
+SEED = int(os.environ.get("SEED", "42"))
+
+# ── Reproducibility ───────────────────────────────────────
+random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+# ── W&B Init ──────────────────────────────────────────────
+import wandb
+wandb.init(project=WANDB_PROJECT, entity=WANDB_ENTITY or None, config={
+    "batch_size": BATCH_SIZE, "lr": LEARNING_RATE, "epochs": EPOCHS,
+    "dropout": DROPOUT, "class_weights": USE_CLASS_WEIGHTS,
+    "augmentation": AUGMENTATION, "warmup": WARMUP_EPOCHS,
+    "optimizer": OPTIMIZER, "model": "resnet18", "dataset": "food-101-hotdog-binary",
+})
+
+# ── Device ────────────────────────────────────────────────
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+if device.type == "cuda":
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+
+# ── Transforms ────────────────────────────────────────────
+if AUGMENTATION != "none":
+    train_transform = T.Compose([
+        T.RandomResizedCrop(224, scale=(0.8, 1.0)),
+        T.RandomHorizontalFlip(),
+        T.RandomRotation(15),
+        T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+        T.Lambda(lambda x: x.convert("RGB")),
+        T.ToTensor(),
+        T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ])
+else:
+    train_transform = T.Compose([
+        T.Resize(256), T.CenterCrop(224),
+        T.Lambda(lambda x: x.convert("RGB")),
+        T.ToTensor(),
+        T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ])
+
+val_transform = T.Compose([
+    T.Resize(256), T.CenterCrop(224),
+    T.Lambda(lambda x: x.convert("RGB")),
+    T.ToTensor(),
+    T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+])
+
+
+# ── Dataset: Food-101 → Binary (hotdog vs not) ───────────
+class HotDogBinaryDataset(Dataset):
+    """Wraps a HuggingFace Food-101 split into hotdog (1) vs not-hotdog (0).
+
+    Memory-efficient: only stores indices, loads images on-the-fly.
+    """
+
+    def __init__(self, hf_dataset, transform, balance=True):
+        self.hf_dataset = hf_dataset
+        self.transform = transform
+
+        # Food-101 class index for hot_dog
+        label_names = hf_dataset.features["label"].names
+        hotdog_idx = label_names.index("hot_dog")
+
+        # Build index lists (just integers, not images)
+        hotdog_indices = []
+        other_indices = []
+
+        for i, label in enumerate(hf_dataset["label"]):
+            if label == hotdog_idx:
+                hotdog_indices.append(i)
+            else:
+                other_indices.append(i)
+
+        print(f"  Raw: {len(hotdog_indices)} hotdog, {len(other_indices)} not-hotdog")
+
+        if balance:
+            random.shuffle(other_indices)
+            other_indices = other_indices[:len(hotdog_indices)]
+            print(f"  Balanced: {len(hotdog_indices)} hotdog, {len(other_indices)} not-hotdog")
+
+        # Store (hf_index, binary_label) pairs
+        self.samples = [(idx, 1) for idx in hotdog_indices] + \
+                       [(idx, 0) for idx in other_indices]
+        random.shuffle(self.samples)
+
+        # Count labels for class weights
+        self.label_counts = defaultdict(int)
+        for _, label in self.samples:
+            self.label_counts[label] += 1
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        hf_idx, label = self.samples[idx]
+        image = self.hf_dataset[hf_idx]["image"]
+        image = self.transform(image)
+        return image, label
+
+
+print("Loading Food-101 dataset...")
+from datasets import load_dataset
+food101 = load_dataset("food101")
+
+print("Building training set...")
+train_ds = HotDogBinaryDataset(food101["train"], train_transform, balance=True)
+print("Building validation set...")
+val_ds = HotDogBinaryDataset(food101["validation"], val_transform, balance=True)
+
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
+                          num_workers=NUM_WORKERS, pin_memory=True)
+val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False,
+                        num_workers=NUM_WORKERS, pin_memory=True)
+
+print(f"Train: {len(train_ds)} samples, Val: {len(val_ds)} samples")
+print(f"Batches per epoch: {len(train_loader)}")
+
+# ── Class Weights ─────────────────────────────────────────
+if USE_CLASS_WEIGHTS:
+    total = sum(train_ds.label_counts.values())
+    weights = torch.tensor([total / (2 * train_ds.label_counts[i]) for i in range(2)],
+                           dtype=torch.float32).to(device)
+    print(f"Class weights: {weights.tolist()}")
+else:
+    weights = None
+
+# ── Model ─────────────────────────────────────────────────
+print("Loading ResNet-18 pretrained model...")
+model = torchvision.models.resnet18(weights=torchvision.models.ResNet18_Weights.DEFAULT)
+
+if DROPOUT > 0:
+    model.fc = nn.Sequential(nn.Dropout(DROPOUT), nn.Linear(512, 2))
+else:
+    model.fc = nn.Linear(512, 2)
+
+model = model.to(device)
+param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f"Trainable parameters: {param_count:,}")
+
+# ── Loss + Optimizer ──────────────────────────────────────
+criterion = nn.CrossEntropyLoss(weight=weights)
+
+if OPTIMIZER == "adamw":
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=0.01)
+elif OPTIMIZER == "sgd":
+    optimizer = torch.optim.SGD(model.parameters(), lr=LEARNING_RATE,
+                                 momentum=0.9, weight_decay=5e-4)
+else:
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+
+# ── Scheduler ─────────────────────────────────────────────
+if WARMUP_EPOCHS > 0:
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=0.1, total_iters=WARMUP_EPOCHS
+    )
+cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+
+# ── Training Loop ─────────────────────────────────────────
+best_acc = 0.0
+print(f"\n{'='*60}")
+print(f"Training: {EPOCHS} epochs, batch={BATCH_SIZE}, lr={LEARNING_RATE}, opt={OPTIMIZER}")
+print(f"{'='*60}\n")
+
+for epoch in range(EPOCHS):
+    model.train()
+    running_loss, correct, total = 0.0, 0, 0
+
+    for batch_idx, (images, labels) in enumerate(train_loader):
+        images, labels = images.to(device), labels.to(device)
+        optimizer.zero_grad()
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item()
+        _, predicted = outputs.max(1)
+        total += labels.size(0)
+        correct += predicted.eq(labels).sum().item()
+
+        if (batch_idx + 1) % 10 == 0:
+            print(f"  Epoch {epoch+1} [{batch_idx+1}/{len(train_loader)}] "
+                  f"loss={loss.item():.4f} acc={100.*correct/total:.1f}%")
+
+    train_acc = 100.0 * correct / total
+
+    # LR scheduling
+    if WARMUP_EPOCHS > 0 and epoch < WARMUP_EPOCHS:
+        warmup_scheduler.step()
+    else:
+        cosine_scheduler.step()
+
+    # ── Validation ────────────────────────────────────────
+    model.eval()
+    val_correct, val_total, val_loss = 0, 0, 0.0
+    all_preds, all_labels = [], []
+
+    with torch.no_grad():
+        for images, labels in val_loader:
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            val_loss += loss.item()
+            _, predicted = outputs.max(1)
+            val_total += labels.size(0)
+            val_correct += predicted.eq(labels).sum().item()
+            all_preds.extend(predicted.cpu().tolist())
+            all_labels.extend(labels.cpu().tolist())
+
+    val_acc = 100.0 * val_correct / val_total
+
+    # Per-class accuracy
+    class_correct = defaultdict(int)
+    class_total = defaultdict(int)
+    for p, l in zip(all_preds, all_labels):
+        class_total[l] += 1
+        if p == l:
+            class_correct[l] += 1
+
+    class_names = {0: "not_hotdog", 1: "hotdog"}
+    per_class = {class_names[c]: 100.0 * class_correct[c] / class_total[c]
+                 for c in class_total}
+
+    # Log to W&B
+    log = {
+        "epoch": epoch + 1,
+        "train_loss": running_loss / len(train_loader),
+        "train_accuracy": train_acc,
+        "val_loss": val_loss / len(val_loader),
+        "val_accuracy": val_acc,
+        "lr": optimizer.param_groups[0]["lr"],
+    }
+    for name, acc in per_class.items():
+        log[f"class/{name}"] = acc
+    wandb.log(log)
+
+    print(f"\nEpoch {epoch+1}/{EPOCHS}")
+    print(f"  Train: {train_acc:.2f}% | Val: {val_acc:.2f}%")
+    for name, acc in per_class.items():
+        print(f"  {name}: {acc:.2f}%")
+    print(f"  LR: {optimizer.param_groups[0]['lr']:.6f}")
+
+    # Save best
+    if val_acc > best_acc:
+        best_acc = val_acc
+        torch.save(model.state_dict(), "best_model.pth")
+        wandb.save("best_model.pth")
+        print(f"  New best: {best_acc:.2f}%")
+
+# ── Final Summary ─────────────────────────────────────────
+print(f"\n{'='*60}")
+print(f"Training complete! Best val accuracy: {best_acc:.2f}%")
+print(f"\nPer-class results:")
+for name, acc in sorted(per_class.items(), key=lambda x: x[1]):
+    status = "PASS" if acc >= 90 else "WARN" if acc >= 70 else "FAIL"
+    print(f"  [{status}] {name}: {acc:.1f}%")
+print(f"{'='*60}")
+
+wandb.log({"best_val_accuracy": best_acc})
+wandb.finish()
